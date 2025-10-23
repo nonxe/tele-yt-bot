@@ -54,13 +54,27 @@ function isValidYouTubeUrl(url) {
   }
 }
 
-// Get video info and formats
+// Get video info and formats with proper headers and cookies
 async function getVideoInfo(url) {
   try {
+    const agent = ytdl.createAgent(undefined, {
+      localAddress: undefined
+    });
+
     const info = await ytdl.getInfo(url, {
+      agent,
       requestOptions: {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Cache-Control': 'max-age=0'
         }
       }
     });
@@ -216,7 +230,7 @@ bot.on('callback_query', async (ctx) => {
   }
 });
 
-// Download video
+// Download video with proper agent
 async function downloadVideo(ctx, url, quality, videoId) {
   const outputPath = path.join(TEMP_DIR, `${videoId}_${quality}.mp4`);
   
@@ -230,7 +244,19 @@ async function downloadVideo(ctx, url, quality, videoId) {
     
     await ctx.editMessageText('⬇️ Downloading video...');
     
-    const videoStream = ytdl(url, { format: format });
+    const agent = ytdl.createAgent(undefined, {
+      localAddress: undefined
+    });
+    
+    const videoStream = ytdl(url, { 
+      format: format,
+      agent,
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      }
+    });
     const writeStream = fs.createWriteStream(outputPath);
     
     await new Promise((resolve, reject) => {
@@ -265,7 +291,7 @@ async function downloadVideo(ctx, url, quality, videoId) {
   }
 }
 
-// Download audio
+// Download audio with proper agent
 async function downloadAudio(ctx, url, videoId) {
   const audioPath = path.join(TEMP_DIR, `${videoId}_audio.webm`);
   const mp3Path = path.join(TEMP_DIR, `${videoId}.mp3`);
@@ -275,7 +301,19 @@ async function downloadAudio(ctx, url, videoId) {
     
     await ctx.editMessageText('⬇️ Downloading audio...');
     
-    const audioStream = ytdl(url, { quality: 'highestaudio' });
+    const agent = ytdl.createAgent(undefined, {
+      localAddress: undefined
+    });
+    
+    const audioStream = ytdl(url, { 
+      quality: 'highestaudio',
+      agent,
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      }
+    });
     const writeStream = fs.createWriteStream(audioPath);
     
     await new Promise((resolve, reject) => {
