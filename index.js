@@ -1,33 +1,28 @@
 /**
- * tele-yt-bot - Telegram YouTube downloader (improved)
+ * tele-yt-bot - Telegram YouTube downloader (robust)
  *
- * Fixes and features:
- * - Uses an in-memory id map for callback data to avoid long callback payloads.
- * - MAX_FILE_SIZE env var (bytes) to prevent trying uploads larger than Telegram/Heroku can handle.
- * - Checks contentLength or estimates size; warns user if file likely too large.
- * - Converts audio to MP3 using ffmpeg and writes to a temp file before sending (more reliable).
- * - Sends video either by streaming (if safe) or by downloading to a temp file and sending as document.
+ * Features:
+ * - Tries ytdl-core first (with User-Agent header)
+ * - Falls back to yt-dlp via youtube-dl-exec on extractor errors (e.g., Status code: 410)
+ * - Offers resolution buttons + Audio-only
+ * - Streams to Telegram; converts audio to mp3 when needed via ffmpeg
  *
- * Environment variables:
- * - BOT_TOKEN (required)
- * - MAX_FILE_SIZE (optional, default 50 * 1024 * 1024 = 50MB)
+ * Required env:
+ * - BOT_TOKEN
  *
- * Note: This implementation stores pending download info in memory. For production across multiple dynos
- * you should use a shared store (Redis / DB) to persist pending requests.
+ * Notes:
+ * - Uses polling (Procfile sets worker: node index.js)
+ * - youtube-dl-exec spawns yt-dlp; ffmpeg-static provides ffmpeg binary
  */
 
 const { Telegraf, Markup } = require('telegraf');
 const ytdl = require('ytdl-core');
+const ytdlExec = require('youtube-dl-exec');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
-const { pipeline } = require('stream');
-const { promisify } = require('util');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
+const { PassThrough } = require('stream');
 const mime = require('mime');
 
-const pipe = promisify(pipeline);
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -36,291 +31,333 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || (50 * 1024 * 1024), 10); // 50 MB default
-
 const bot = new Telegraf(BOT_TOKEN);
-
-// In-memory map to hold pending download requests referenced by short ids
-const pending = new Map();
-// Entries expire after a timeout to avoid memory leak
-const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes
-
-function makeId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
-}
 
 function extractYouTubeUrl(text) {
   if (!text) return null;
   const urlRegex = /(https?:\/\/)?(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/)[\w-]{6,}/i;
   const match = text.match(urlRegex);
-  if (!match) return null;
-  const candidate = match[0];
-  return candidate.startsWith('http') ? candidate : 'https://' + candidate;
+  return match ? (match[0].startsWith('http') ? match[0] : 'https://' + match[0]) : null;
 }
 
+// Returns { title, resolutions:[{label, itag, source}], audio:{itag, source}, _fallbackInfo? }
 async function getFormatsInfo(url) {
-  const info = await ytdl.getInfo(url);
-  const formats = info.formats.filter(f => f.container && (f.hasVideo || f.hasAudio));
-  const videoFormats = formats.filter(f => f.hasVideo && f.hasAudio);
-  const resMap = {};
-  videoFormats.forEach(f => {
-    const q = f.qualityLabel || (f.height ? f.height + 'p' : 'unknown');
-    // choose a representative format for that label (prefer larger contentLength)
-    if (!resMap[q] || (resMap[q] && (Number(resMap[q].contentLength || 0) < Number(f.contentLength || 0)))) {
-      resMap[q] = f;
+  // First try ytdl-core with browser UA
+  try {
+    const info = await ytdl.getInfo(url, {
+      requestOptions: {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+        }
+      }
+    });
+
+    const formats = info.formats.filter(f => f.container && (f.hasVideo || f.hasAudio));
+    const videoFormats = formats.filter(f => f.hasVideo && f.hasAudio);
+    const resMap = {};
+    videoFormats.forEach(f => {
+      const q = f.qualityLabel || (f.height ? `${f.height}p` : 'unknown');
+      // prefer larger contentLength if available
+      const existing = resMap[q];
+      if (!existing) {
+        resMap[q] = { itag: f.itag, contentLength: parseInt(f.contentLength || 0, 10) || 0 };
+      } else {
+        const cur = parseInt(f.contentLength || 0, 10) || 0;
+        if (cur > (existing.contentLength || 0)) {
+          resMap[q] = { itag: f.itag, contentLength: cur };
+        }
+      }
+    });
+
+    const audioFormats = formats.filter(f => f.hasAudio && !f.hasVideo);
+    const bestAudio = audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+    return {
+      title: info.videoDetails.title || 'video',
+      resolutions: Object.keys(resMap)
+        .sort((a, b) => {
+          const na = parseInt(a) || 0;
+          const nb = parseInt(b) || 0;
+          return nb - na;
+        })
+        .map(label => ({ label, itag: String(resMap[label].itag), source: 'ytdl' })),
+      audio: bestAudio ? { itag: String(bestAudio.itag), source: 'ytdl' } : null
+    };
+  } catch (err) {
+    const msg = (err && err.message) ? err.message : String(err);
+    console.warn('ytdl-core getInfo failed:', msg);
+
+    // Fallback triggers on extractor-like errors (410/status/extractor/signature)
+    if (msg.includes('Status code: 410') || msg.toLowerCase().includes('extractor') || msg.toLowerCase().includes('signature')) {
+      try {
+        // Use youtube-dl-exec (yt-dlp) to dump JSON metadata
+        const json = await ytdlExec(url, {
+          dumpSingleJson: true,
+          noWarnings: true,
+          noCallHome: true,
+          preferFreeFormats: true,
+          addHeader: [
+            'referer: https://www.youtube.com/',
+            'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+          ]
+        }, { stdio: 'pipe' });
+
+        if (!json || !json.formats) throw new Error('yt-dlp returned no formats');
+
+        const formats = json.formats.filter(f => (f.format_id || f.format) && (f.vcodec !== 'none' || f.acodec !== 'none'));
+        const videoFormats = formats.filter(f => f.vcodec !== 'none' && f.acodec !== 'none');
+        const resMap = {};
+        videoFormats.forEach(f => {
+          const q = f.format_note || (f.height ? `${f.height}p` : (f.tbr ? `${Math.round(f.tbr)}kbps` : 'unknown'));
+          // prefer formats with numeric height or better tbr
+          if (!resMap[q]) resMap[q] = f;
+        });
+
+        const audioFormats = formats.filter(f => (f.vcodec === 'none' || f.vcodec === 'none') && f.acodec !== 'none');
+        const bestAudio = audioFormats.sort((a, b) => (b.abr || b.bitrate || 0) - (a.abr || a.bitrate || 0))[0];
+
+        return {
+          title: json.title || 'video',
+          resolutions: Object.keys(resMap)
+            .sort((a, b) => {
+              const na = parseInt(a) || 0;
+              const nb = parseInt(b) || 0;
+              return nb - na;
+            })
+            .map(label => {
+              const f = resMap[label];
+              return { label, itag: String(f.format_id || f.format), source: 'yt-dlp' };
+            }),
+          audio: bestAudio ? { itag: String(bestAudio.format_id || bestAudio.format), source: 'yt-dlp' } : null,
+          _fallbackInfo: json
+        };
+      } catch (fallbackErr) {
+        console.error('yt-dlp fallback failed:', fallbackErr);
+        throw err; // rethrow original to show user
+      }
     }
-  });
-  const audioFormats = formats.filter(f => f.hasAudio && !f.hasVideo);
-  const bestAudio = audioFormats.sort((a, b) => (Number(b.bitrate || b.audioBitrate || 0) - Number(a.bitrate || a.audioBitrate || 0)))[0];
-  return {
-    title: info.videoDetails.title || 'video',
-    lengthSeconds: parseInt(info.videoDetails.lengthSeconds || '0', 10),
-    resolutions: Object.keys(resMap).sort((a, b) => {
-      const na = parseInt(a) || 0;
-      const nb = parseInt(b) || 0;
-      return nb - na;
-    }).map(label => ({ label, itag: resMap[label].itag, contentLength: resMap[label].contentLength, avgBitrate: resMap[label].averageBitrate || resMap[label].bitrate || 0 })),
-    audioItag: bestAudio ? bestAudio.itag : null,
-    audioContentLength: bestAudio ? bestAudio.contentLength : null,
-    audioAvgBitrate: bestAudio ? (bestAudio.averageBitrate || bestAudio.bitrate || bestAudio.audioBitrate || 0) : 0
-  };
+
+    throw err;
+  }
 }
 
-bot.start((ctx) => {
-  ctx.reply('Welcome! Send me a YouTube link and I\'ll show download options (video resolutions + audio-only). Use /help for details.');
+bot.start(ctx => {
+  ctx.reply('Welcome! Send a YouTube link and I will show download options (video resolutions + audio-only). Use /help for details.');
 });
 
-bot.help((ctx) => {
-  ctx.replyWithMarkdown('Usage:\n- Send a YouTube link (https://youtu.be/...) or use /download <youtube_url>\n- After link is processed, tap a resolution button or "Audio only" to download.\n\nNotes:\n- Set BOT_TOKEN as an environment variable before running.\n- MAX_FILE_SIZE (bytes) can be set to limit uploads (default 50MB).');
+bot.help(ctx => {
+  ctx.replyWithMarkdown(
+    'Usage:\n- Send a YouTube link (https://youtu.be/...) or use /download <youtube_url>\n- Tap a resolution button or "Audio only" to download.\n\nNotes:\n- Set BOT_TOKEN environment variable before running.\n- Deploy to Heroku using the README Deploy button.'
+  );
 });
 
-bot.command('download', async (ctx) => {
+bot.command('download', async ctx => {
   const args = ctx.message.text.split(' ').slice(1);
   const url = args[0] || extractYouTubeUrl(ctx.message.reply_to_message && ctx.message.reply_to_message.text);
-  if (!url) {
-    return ctx.reply('Please provide a YouTube URL: /download https://youtu.be/xxxxx');
-  }
+  if (!url) return ctx.reply('Please provide a YouTube URL: /download https://youtu.be/xxxxx');
   await handleUrl(ctx, url);
 });
 
-bot.on('text', async (ctx) => {
+bot.on('text', async ctx => {
   const text = ctx.message.text;
   const url = extractYouTubeUrl(text);
-  if (url) {
-    await handleUrl(ctx, url);
-  }
+  if (url) await handleUrl(ctx, url);
 });
 
 async function handleUrl(ctx, url) {
-  let msg = await ctx.reply('Fetching formats, please wait...');
+  const sent = await ctx.reply('Fetching formats, please wait...');
   try {
     const info = await getFormatsInfo(url);
     const buttons = [];
-    // Add audio-only first if available
-    if (info.audioItag) {
-      const id = makeId();
-      pending.set(id, { url, itag: info.audioItag, type: 'audio', title: info.title, lengthSeconds: info.lengthSeconds, contentLength: info.audioContentLength, avgBitrate: info.audioAvgBitrate });
-      setTimeout(() => pending.delete(id), PENDING_TTL_MS);
-      buttons.push(Markup.button.callback('Audio only', `dl:${id}`));
+
+    // audio first
+    if (info.audio) {
+      buttons.push(Markup.button.callback('Audio only', `dl:audio:${encodeURIComponent(JSON.stringify(info.audio))}:${encodeURIComponent(url)}`));
     }
-    // Build resolution buttons
+
     info.resolutions.forEach(r => {
-      const id = makeId();
-      pending.set(id, { url, itag: r.itag, type: 'video', title: info.title, lengthSeconds: info.lengthSeconds, contentLength: r.contentLength, avgBitrate: r.avgBitrate });
-      setTimeout(() => pending.delete(id), PENDING_TTL_MS);
-      buttons.push(Markup.button.callback(r.label, `dl:${id}`));
+      // encode resolution object as JSON so we carry source and itag
+      buttons.push(Markup.button.callback(r.label, `dl:video:${encodeURIComponent(JSON.stringify(r))}:${encodeURIComponent(url)}`));
     });
 
-    // Add cancel
-    const cancelId = makeId();
-    pending.set(cancelId, { cancel: true, url });
-    setTimeout(() => pending.delete(cancelId), PENDING_TTL_MS);
-    buttons.push(Markup.button.callback('Cancel', `cancel:${cancelId}`));
+    buttons.push(Markup.button.callback('Cancel', `cancel:${encodeURIComponent(url)}`));
 
-    // Arrange keyboard in rows of 2
-    const keyboard = [];
-    for (let i = 0; i < buttons.length; i += 2) {
-      keyboard.push(buttons.slice(i, i + 2));
-    }
+    // Build rows (2 buttons per row)
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
 
-    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+    await ctx.telegram.editMessageText(ctx.chat.id, sent.message_id, null,
       `Found: *${escapeMarkdown(info.title)}*\nChoose a format:`,
-      { parse_mode: 'Markdown', reply_markup: Markup.inlineKeyboard(keyboard).reply_markup }
+      { parse_mode: 'Markdown', reply_markup: Markup.inlineKeyboard(rows).reply_markup }
     );
   } catch (err) {
-    console.error('Error in handleUrl:', err);
-    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `Failed to fetch formats: ${err.message}`);
+    console.error('handleUrl error:', err);
+    await ctx.telegram.editMessageText(ctx.chat.id, sent.message_id, null, `Failed to fetch formats: ${err.message || err}`);
   }
 }
 
-bot.on('callback_query', async (ctx) => {
+bot.on('callback_query', async ctx => {
   const data = ctx.callbackQuery.data;
   if (!data) return ctx.answerCbQuery();
   if (data.startsWith('cancel:')) {
-    const id = data.split(':')[1];
-    pending.delete(id);
     await ctx.editMessageText('Cancelled.');
     return ctx.answerCbQuery('Cancelled');
   }
-  if (!data.startsWith('dl:')) return ctx.answerCbQuery();
-  const id = data.split(':')[1];
-  const entry = pending.get(id);
-  if (!entry) {
-    await ctx.answerCbQuery('Request expired or not found. Please send the link again.', { show_alert: true });
-    return;
-  }
-  // prevent reuse
-  pending.delete(id);
 
-  await ctx.answerCbQuery(`Preparing ${entry.type === 'audio' ? 'audio' : 'video'}...`);
+  // formats:
+  // dl:video:<encodedResolutionJson>:<encodedUrl>
+  // dl:audio:<encodedAudioJson>:<encodedUrl>
+  const parts = data.split(':');
+  if (parts.length < 4) return ctx.answerCbQuery();
+  const [, type, encodedJson, encodedUrl] = parts;
+  const payload = JSON.parse(decodeURIComponent(encodedJson));
+  const url = decodeURIComponent(encodedUrl);
+
+  await ctx.answerCbQuery(`Preparing ${type === 'audio' ? 'audio' : 'video'}...`);
   try {
-    await sendFormat(ctx, entry);
+    if (type === 'audio') {
+      await sendFormat(ctx, url, payload.itag, payload.source, true);
+    } else {
+      await sendFormat(ctx, url, payload.itag, payload.source, false);
+    }
   } catch (err) {
-    console.error('Error sending format:', err);
+    console.error('sendFormat error:', err);
     try { await ctx.reply('Failed to prepare file: ' + (err.message || err)); } catch (e) {}
   }
 });
 
-async function sendFormat(ctx, entry) {
+// sendFormat: url, itag (string), source: 'ytdl' | 'yt-dlp', isAudio boolean
+async function sendFormat(ctx, url, itag, source, isAudio) {
   await ctx.replyWithChatAction('upload_document');
-  const { url, itag, type, title, lengthSeconds } = entry;
-  const info = await ytdl.getInfo(url);
-  const chosenFormat = ytdl.chooseFormat(info.formats, { quality: itag });
-  if (!chosenFormat) {
-    return ctx.reply('Requested format not available.');
-  }
 
-  const fileTitle = sanitizeFilename(title || info.videoDetails.title || 'video');
+  // ytdl-core path (source === 'ytdl')
+  if (source === 'ytdl') {
+    const info = await ytdl.getInfo(url);
+    const title = sanitizeFilename(info.videoDetails.title || 'video');
 
-  // Determine content length if available
-  let contentLength = chosenFormat.contentLength ? Number(chosenFormat.contentLength) : null;
-  // If not available, try averageBitrate or bitrate estimate
-  if (!contentLength) {
-    const avgBitrate = Number(chosenFormat.averageBitrate || chosenFormat.bitrate || chosenFormat.audioBitrate || entry.avgBitrate || 0);
-    if (avgBitrate && lengthSeconds) {
-      // averageBitrate is in bits/sec -> convert to bytes
-      contentLength = Math.ceil((avgBitrate / 8) * Number(lengthSeconds));
-    }
-  }
-
-  if (contentLength && contentLength > MAX_FILE_SIZE) {
-    const mb = (contentLength / (1024 * 1024)).toFixed(2);
-    const limitMb = (MAX_FILE_SIZE / (1024 * 1024)).toFixed(2);
-    return ctx.reply(`The selected file is likely too large (~${mb} MB) which exceeds the configured limit (${limitMb} MB). Please choose a lower resolution or use Audio only.`);
-  }
-
-  // If we still don't know size, be conservative for video: refuse and ask user to choose lower resolution or audio-only
-  if (!contentLength && type === 'video') {
-    return ctx.reply('Could not determine file size reliably. To avoid failed uploads, please try a lower resolution or use Audio only.');
-  }
-
-  if (type === 'audio') {
-    // audio: convert to mp3 file in tmp then send
-    const tempFile = path.join(os.tmpdir(), `${fileTitle}-${Date.now()}.mp3`);
-    try {
+    if (isAudio) {
+      // audio: stream audio-only using ytdl, convert to mp3 via ffmpeg
       const audioStream = ytdl.downloadFromInfo(info, { quality: itag });
-      await new Promise((resolve, reject) => {
-        const ff = ffmpeg(audioStream)
-          .audioBitrate(128)
-          .format('mp3')
-          .on('error', (err) => {
-            console.error('ffmpeg error', err);
-            reject(err);
-          })
-          .on('end', () => resolve());
-        ff.save(tempFile);
-      });
-      // Send file
-      const stat = fs.statSync(tempFile);
-      if (stat.size > MAX_FILE_SIZE) {
-        fs.unlinkSync(tempFile);
-        return ctx.reply(`Converted file is too large (${(stat.size / (1024 * 1024)).toFixed(2)} MB). Try a different option.`);
-      }
-      const readStream = fs.createReadStream(tempFile);
-      await ctx.replyWithDocument({ source: readStream, filename: `${fileTitle}.mp3` }).catch(err => {
-        console.error('send audio err', err);
-        throw err;
-      });
-    } finally {
-      // cleanup
-      try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (e) {}
-    }
-  } else {
-    // video: if contentLength known and <= MAX, attempt streaming, else download to tmp and send
-    const ext = chosenFormat.container || 'mp4';
-    const filename = `${fileTitle}.${ext}`;
+      const pass = new PassThrough();
+      const filename = `${title}.mp3`;
 
-    // If streaming directly (contentLength known and small), stream
-    if (contentLength && contentLength <= MAX_FILE_SIZE) {
-      const videoStream = ytdl.downloadFromInfo(info, { quality: itag });
+      ffmpeg(audioStream)
+        .noVideo()
+        .audioBitrate(128)
+        .format('mp3')
+        .on('error', err => console.error('ffmpeg audio error:', err))
+        .pipe(pass);
+
       try {
-        await ctx.replyWithDocument({ source: videoStream, filename }).catch(async (err) => {
-          console.error('streaming upload failed, err:', err);
-          // fallback: download to temp then send
-          throw err;
-        });
+        await ctx.replyWithDocument({ source: pass, filename });
       } catch (err) {
-        // fallback to temp file
-        const tmpPath = path.join(os.tmpdir(), `${fileTitle}-${Date.now()}.${ext}`);
-        try {
-          const dlStream = ytdl.downloadFromInfo(info, { quality: itag });
-          await pipe(dlStream, fs.createWriteStream(tmpPath));
-          const stat = fs.statSync(tmpPath);
-          if (stat.size > MAX_FILE_SIZE) {
-            fs.unlinkSync(tmpPath);
-            return ctx.reply(`Downloaded file is too large (${(stat.size / (1024 * 1024)).toFixed(2)} MB). Try a different option.`);
-          }
-          await ctx.replyWithDocument({ source: fs.createReadStream(tmpPath), filename });
-        } finally {
-          try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
-        }
+        console.error('upload audio (ytdl) failed:', err);
+        await ctx.reply('Upload failed: ' + (err.message || err));
       }
     } else {
-      // If contentLength unknown but previously passed earlier checks, do conservative fallback: download to tmp and check
-      const tmpPath = path.join(os.tmpdir(), `${fileTitle}-${Date.now()}.${ext}`);
+      // video: stream chosen itag
+      const format = ytdl.chooseFormat(info.formats, { quality: itag });
+      if (!format) return ctx.reply('Requested format not available (ytdl).');
+
+      const ext = format.container || 'mp4';
+      const filename = `${sanitizeFilename(info.videoDetails.title || 'video')}.${ext}`;
+      const videoStream = ytdl.downloadFromInfo(info, { quality: itag });
+
       try {
-        const dlStream = ytdl.downloadFromInfo(info, { quality: itag });
-        await pipe(dlStream, fs.createWriteStream(tmpPath));
-        const stat = fs.statSync(tmpPath);
-        if (stat.size > MAX_FILE_SIZE) {
-          fs.unlinkSync(tmpPath);
-          return ctx.reply(`Downloaded file is too large (${(stat.size / (1024 * 1024)).toFixed(2)} MB). Try a different option.`);
-        }
-        await ctx.replyWithDocument({ source: fs.createReadStream(tmpPath), filename });
-      } finally {
-        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+        await ctx.replyWithDocument({ source: videoStream, filename });
+      } catch (err) {
+        console.error('upload video (ytdl) failed:', err);
+        await ctx.reply('Upload failed: ' + (err.message || err));
       }
     }
+    return;
   }
+
+  // fallback yt-dlp path (source === 'yt-dlp')
+  // Use youtube-dl-exec to spawn yt-dlp and pipe stdout
+  if (source === 'yt-dlp') {
+    const filenameBase = sanitizeFilename((new Date()).toISOString()); // will try to get title if possible
+    if (isAudio) {
+      // Use yt-dlp to stream best audio, pipe to ffmpeg to convert to mp3
+      // We'll spawn yt-dlp with -f <itag> -o -
+      try {
+        const subprocess = ytdlExec(url, {
+          format: itag,
+          output: '-',
+          preferFreeFormats: true,
+          addHeader: ['referer: https://www.youtube.com/', 'user-agent: Mozilla/5.0']
+        }, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        const pass = new PassThrough();
+        const filename = `${filenameBase}.mp3`;
+
+        ffmpeg(subprocess.stdout)
+          .noVideo()
+          .audioBitrate(128)
+          .format('mp3')
+          .on('error', err => {
+            console.error('ffmpeg (yt-dlp->mp3) error:', err);
+            try { subprocess.kill('SIGKILL'); } catch (e) {}
+          })
+          .pipe(pass);
+
+        try {
+          await ctx.replyWithDocument({ source: pass, filename });
+        } catch (err) {
+          console.error('upload audio (yt-dlp) failed:', err);
+          await ctx.reply('Upload failed: ' + (err.message || err));
+          try { subprocess.kill('SIGKILL'); } catch (e) {}
+        }
+      } catch (err) {
+        console.error('yt-dlp audio spawn failed:', err);
+        await ctx.reply('Failed to download audio: ' + (err.message || err));
+      }
+    } else {
+      // Video via yt-dlp: spawn yt-dlp to stdout with format itag
+      try {
+        const subprocess = ytdlExec(url, {
+          format: itag,
+          output: '-',
+          preferFreeFormats: true,
+          addHeader: ['referer: https://www.youtube.com/', 'user-agent: Mozilla/5.0']
+        }, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        // We don't know extension reliably, try mp4
+        const filename = `${filenameBase}.mp4`;
+        try {
+          await ctx.replyWithDocument({ source: subprocess.stdout, filename });
+        } catch (err) {
+          console.error('upload video (yt-dlp) failed:', err);
+          await ctx.reply('Upload failed: ' + (err.message || err));
+          try { subprocess.kill('SIGKILL'); } catch (e) {}
+        }
+      } catch (err) {
+        console.error('yt-dlp video spawn failed:', err);
+        await ctx.reply('Failed to download video: ' + (err.message || err));
+      }
+    }
+    return;
+  }
+
+  // Unknown source
+  await ctx.reply('Unknown format source; cannot process.');
 }
 
 function sanitizeFilename(name) {
-  return (name || '').replace(/[\\\/:*?"<>|]+/g, '').slice(0, 200);
+  return (name || 'file').replace(/[\\\/:*?"<>|]+/g, '').slice(0, 200);
 }
 
 function escapeMarkdown(text) {
-  return (text || '').replace(/([_*[\\]()~`>#+\\-=|{}.!])/g, '\\$1');
+  return (text || '').replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
 }
-
-// Periodic cleanup (in case)
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of pending.entries()) {
-    // If entry older than TTL, remove. We stored no timestamp, but IDs encode time. We'll parse id date part.
-    // IDs start with Date.now().toString(36)
-    try {
-      const tsPart = parseInt(k.slice(0, 8), 36);
-      if (!isNaN(tsPart) && (now - tsPart) > PENDING_TTL_MS) pending.delete(k);
-    } catch (e) {}
-  }
-}, 60 * 1000);
 
 bot.catch((err, ctx) => {
   console.error('Bot error for update', ctx.update, 'error', err);
 });
 
 bot.launch().then(() => {
-  console.log('Bot started (polling). MAX_FILE_SIZE =', MAX_FILE_SIZE);
+  console.log('Bot started (polling).');
 });
 
 // Graceful stop
