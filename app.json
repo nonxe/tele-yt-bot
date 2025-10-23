@@ -1,3 +1,4 @@
+
 {
   "name": "Telegram YouTube Downloader Bot",
   "description": "A Telegram bot that downloads YouTube videos with resolution selection and audio-only option",
@@ -9,14 +10,11 @@
     "youtube",
     "downloader",
     "nodejs",
-    "ytdl"
+    "yt-dlp"
   ],
   "buildpacks": [
     {
       "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
-    },
-    {
-      "url": "https://github.com/heroku/heroku-buildpack-apt"
     },
     {
       "url": "heroku/nodejs"
@@ -30,15 +28,8 @@
   "env": {
     "BOT_TOKEN": {
       "description": "Your Telegram Bot Token from @BotFather",
-      "required": true,
-      "value": ""
-    },
-    "NODE_ENV": {
-      "description": "Node environment",
-      "value": "production",
-      "required": false
+      "required": true
     }
   },
-  "stack": "heroku-22",
-  "addons": []
+  "stack": "heroku-24"
 }
