@@ -1,19 +1,39 @@
 {
-  "name": "tele-yt-bot",
-  "description": "Telegram YouTube downloader bot (Node.js)",
+  "name": "Telegram YouTube Downloader Bot",
+  "description": "A Telegram bot that downloads YouTube videos with resolution selection and audio-only option",
   "repository": "https://github.com/nonxe/tele-yt-bot",
-  "logo": "https://nodejs.org/static/images/logos/nodejs-new-pantone-black.svg",
-  "keywords": ["telegram", "youtube", "bot", "node"],
-  "env": {
-    "BOT_TOKEN": {
-      "description": "Telegram bot token",
-      "required": true
+  "logo": "https://telegram.org/img/t_logo.png",
+  "keywords": [
+    "telegram",
+    "bot",
+    "youtube",
+    "downloader",
+    "nodejs",
+    "ytdl"
+  ],
+  "buildpacks": [
+    {
+      "url": "heroku/nodejs"
     }
-  },
+  ],
   "formation": {
     "worker": {
       "quantity": 1,
-      "size": "standard-1X"
+      "size": "basic"
     }
-  }
+  },
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Your Telegram Bot Token from @BotFather",
+      "required": true,
+      "value": ""
+    },
+    "NODE_ENV": {
+      "description": "Node environment",
+      "value": "production",
+      "required": false
+    }
+  },
+  "stack": "heroku-22",
+  "addons": []
 }
