@@ -1,4 +1,4 @@
-```markdown
+
 # tele-yt-bot
 
 Telegram YouTube downloader bot (Node.js). Supports selecting video resolution and audio-only downloads.
