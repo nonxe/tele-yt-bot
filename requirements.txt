@@ -1,0 +1,2 @@
+# Empty - Python buildpack will install Python runtime only
+# yt-dlp binary will be downloaded by yt-dlp-wrap
