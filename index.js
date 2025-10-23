@@ -83,11 +83,21 @@ function isValidYouTubeUrl(url) {
   }
 }
 
-// Get video info using yt-dlp
+// Get video info using yt-dlp with anti-bot measures
 async function getVideoInfo(url) {
   try {
-    const info = await ytDlp.getVideoInfo(url);
-    return info;
+    const info = await ytDlp.execPromise([
+      url,
+      '--dump-json',
+      '--no-warnings',
+      '--no-playlist',
+      '--extractor-args', 'youtube:player_client=android,web',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+      '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      '--add-header', 'Sec-Fetch-Mode:navigate'
+    ]);
+    return JSON.parse(info);
   } catch (error) {
     throw new Error(`Failed to fetch video info: ${error.message}`);
   }
@@ -281,14 +291,19 @@ async function downloadVideo(ctx, url, quality, videoId) {
     
     const height = quality.replace('p', '');
     
-    // Download with yt-dlp
+    // Download with yt-dlp with anti-bot measures
     await ytDlp.execPromise([
       url,
-      '-f', `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`,
+      '-f', `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`,
       '--merge-output-format', 'mp4',
       '-o', outputPath,
       '--no-playlist',
       '--no-warnings',
+      '--extractor-args', 'youtube:player_client=android,web',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+      '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      '--concurrent-fragments', '5',
       '--newline'
     ]);
     
@@ -337,16 +352,20 @@ async function downloadAudio(ctx, url, videoId) {
   try {
     await ctx.editMessageText('⬇️ Downloading audio...');
     
-    // Download and convert to MP3 with yt-dlp
+    // Download and convert to MP3 with yt-dlp with anti-bot measures
     await ytDlp.execPromise([
       url,
-      '-f', 'bestaudio',
+      '-f', 'bestaudio/best',
       '-x',
       '--audio-format', 'mp3',
       '--audio-quality', '192K',
       '-o', outputPath,
       '--no-playlist',
       '--no-warnings',
+      '--extractor-args', 'youtube:player_client=android,web',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+      '--concurrent-fragments', '5',
       '--newline'
     ]);
     
