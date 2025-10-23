@@ -8,12 +8,16 @@
     "BOT_TOKEN": {
       "description": "Telegram bot token",
       "required": true
+    },
+    "MAX_FILE_SIZE": {
+      "description": "Maximum allowed upload size in bytes (default 52428800 = 50MB)",
+      "required": false
     }
   },
   "formation": {
     "worker": {
       "quantity": 1,
-      "size": "standard-1X"
+      "size": "eco"
     }
   }
 }
