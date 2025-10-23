@@ -1,0 +1,19 @@
+{
+  "name": "tele-yt-bot",
+  "description": "Telegram YouTube downloader bot (Node.js)",
+  "repository": "https://github.com/nonxe/tele-yt-bot",
+  "logo": "https://nodejs.org/static/images/logos/nodejs-new-pantone-black.svg",
+  "keywords": ["telegram", "youtube", "bot", "node"],
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Telegram bot token",
+      "required": true
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "standard-1X"
+    }
+  }
+}
