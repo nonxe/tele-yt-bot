@@ -91,15 +91,29 @@ async function getVideoInfo(url) {
       '--dump-json',
       '--no-warnings',
       '--no-playlist',
-      '--extractor-args', 'youtube:player_client=android,web',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      '--add-header', 'Accept-Language:en-US,en;q=0.9',
-      '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      '--add-header', 'Sec-Fetch-Mode:navigate'
+      '--extractor-args', 'youtube:player_client=android_creator,android,web',
+      '--extractor-args', 'youtube:skip=hls,dash',
+      '--user-agent', 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; en_US)',
+      '--no-check-certificates',
+      '--prefer-free-formats',
+      '--compat-options', 'no-youtube-channel-redirect'
     ]);
     return JSON.parse(info);
   } catch (error) {
-    throw new Error(`Failed to fetch video info: ${error.message}`);
+    // Fallback: Try with web client
+    try {
+      const fallbackInfo = await ytDlp.execPromise([
+        url,
+        '--dump-json',
+        '--no-warnings',
+        '--no-playlist',
+        '--extractor-args', 'youtube:player_client=web',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      ]);
+      return JSON.parse(fallbackInfo);
+    } catch (fallbackError) {
+      throw new Error(`Failed to fetch video info. YouTube may be blocking requests. Try again later.`);
+    }
   }
 }
 
@@ -299,11 +313,12 @@ async function downloadVideo(ctx, url, quality, videoId) {
       '-o', outputPath,
       '--no-playlist',
       '--no-warnings',
-      '--extractor-args', 'youtube:player_client=android,web',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      '--add-header', 'Accept-Language:en-US,en;q=0.9',
-      '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      '--extractor-args', 'youtube:player_client=android_creator',
+      '--user-agent', 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; en_US)',
+      '--no-check-certificates',
       '--concurrent-fragments', '5',
+      '--retries', '10',
+      '--fragment-retries', '10',
       '--newline'
     ]);
     
@@ -362,10 +377,11 @@ async function downloadAudio(ctx, url, videoId) {
       '-o', outputPath,
       '--no-playlist',
       '--no-warnings',
-      '--extractor-args', 'youtube:player_client=android,web',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+      '--extractor-args', 'youtube:player_client=android_creator',
+      '--user-agent', 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; en_US)',
+      '--no-check-certificates',
       '--concurrent-fragments', '5',
+      '--retries', '10',
       '--newline'
     ]);
     
