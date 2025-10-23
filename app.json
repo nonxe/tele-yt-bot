@@ -1,3 +1,4 @@
+
 {
   "name": "tele-yt-bot",
   "description": "Telegram bot for YouTube downloading (Node.js, Telegraf, ytdl-core)",
@@ -11,9 +12,9 @@
     }
   },
   "formation": {
-    "web": {
+    "worker": {
       "quantity": 1,
-      "size": "free"
+      "size": "eco"
     }
   },
   "scripts": {
