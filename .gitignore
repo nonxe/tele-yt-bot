@@ -1,5 +1,9 @@
 node_modules/
+temp/
+*.log
 .env
 .DS_Store
-npm-debug.log
-yarn-error.log
+*.mp4
+*.mp3
+*.webm
+*.m4a
