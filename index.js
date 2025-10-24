@@ -1,46 +1,22 @@
 const { Telegraf, Markup } = require('telegraf');
-const YTDlpWrap = require('yt-dlp-wrap').default;
+const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { exec } = require('child_process');
-const { promisify } = require('util');
-
-const execPromise = promisify(exec);
+const https = require('https');
+const http = require('http');
 
 // Initialize bot
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// API Configuration
+const API_BASE_URL = 'https://for-devs.ddns.net/api/downloader/youtube';
+const API_KEY = process.env.API_KEY || '.r-e406e8b5fc4e447112d95703';
 
 // Temp directory for downloads
 const TEMP_DIR = path.join(__dirname, 'temp');
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR);
-}
-
-// Initialize yt-dlp
-let ytDlp;
-const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
-
-// Download and setup yt-dlp on startup
-async function setupYtDlp() {
-  try {
-    console.log('🔧 Setting up yt-dlp...');
-    
-    // Download yt-dlp binary
-    ytDlp = new YTDlpWrap();
-    await YTDlpWrap.downloadFromGithub(YTDLP_PATH);
-    ytDlp = new YTDlpWrap(YTDLP_PATH);
-    
-    // Make it executable
-    if (process.platform !== 'win32') {
-      await execPromise(`chmod +x ${YTDLP_PATH}`);
-    }
-    
-    console.log('✅ yt-dlp ready!');
-  } catch (error) {
-    console.error('❌ Failed to setup yt-dlp:', error);
-    process.exit(1);
-  }
 }
 
 // Cleanup old files
@@ -83,59 +59,76 @@ function isValidYouTubeUrl(url) {
   }
 }
 
-// Get video info using yt-dlp with anti-bot measures
-async function getVideoInfo(url) {
+// Extract video ID from URL
+function extractVideoId(url) {
   try {
-    const info = await ytDlp.execPromise([
-      url,
-      '--dump-json',
-      '--no-warnings',
-      '--no-playlist',
-      '--extractor-args', 'youtube:player_client=android_creator,android,web',
-      '--extractor-args', 'youtube:skip=hls,dash',
-      '--user-agent', 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; en_US)',
-      '--no-check-certificates',
-      '--prefer-free-formats',
-      '--compat-options', 'no-youtube-channel-redirect'
-    ]);
-    return JSON.parse(info);
-  } catch (error) {
-    // Fallback: Try with web client
-    try {
-      const fallbackInfo = await ytDlp.execPromise([
-        url,
-        '--dump-json',
-        '--no-warnings',
-        '--no-playlist',
-        '--extractor-args', 'youtube:player_client=web',
-        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      ]);
-      return JSON.parse(fallbackInfo);
-    } catch (fallbackError) {
-      throw new Error(`Failed to fetch video info. YouTube may be blocking requests. Try again later.`);
+    const urlObj = new URL(url);
+    if (urlObj.hostname === 'youtu.be') {
+      return urlObj.pathname.slice(1);
     }
+    return urlObj.searchParams.get('v');
+  } catch {
+    return null;
   }
 }
 
-// Get available quality options
-function getQualityOptions(info) {
-  const formats = info.formats || [];
-  
-  // Filter video+audio formats
-  const videoFormats = formats.filter(f => 
-    f.vcodec !== 'none' && 
-    f.acodec !== 'none' && 
-    f.height
-  );
-  
-  // Get unique heights
-  const heights = [...new Set(videoFormats.map(f => f.height))];
-  
-  // Sort descending
-  heights.sort((a, b) => b - a);
-  
-  // Convert to quality labels and limit to 5
-  return heights.slice(0, 5).map(h => `${h}p`);
+// Get video info from API
+async function getVideoInfo(url) {
+  try {
+    const response = await fetch(API_BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': API_KEY
+      },
+      body: JSON.stringify({ url: url })
+    });
+
+    if (!response.ok) {
+      throw new Error(`API returned status ${response.status}`);
+    }
+
+    const data = await response.json();
+    
+    if (!data.status || data.status === 'error') {
+      throw new Error(data.message || 'Failed to fetch video info');
+    }
+
+    return data;
+  } catch (error) {
+    throw new Error(`Failed to fetch video info: ${error.message}`);
+  }
+}
+
+// Download file from URL
+async function downloadFile(url, outputPath) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : http;
+    
+    const file = fs.createWriteStream(outputPath);
+    
+    protocol.get(url, (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`Failed to download: ${response.statusCode}`));
+        return;
+      }
+      
+      response.pipe(file);
+      
+      file.on('finish', () => {
+        file.close();
+        resolve();
+      });
+    }).on('error', (err) => {
+      fs.unlink(outputPath, () => {});
+      reject(err);
+    });
+    
+    file.on('error', (err) => {
+      fs.unlink(outputPath, () => {});
+      reject(err);
+    });
+  });
 }
 
 // Format file size
@@ -161,8 +154,8 @@ bot.start((ctx) => {
     '*Features:*\n' +
     '✅ Multiple quality options\n' +
     '✅ Audio-only MP3 download\n' +
-    '✅ Fast and reliable (using yt-dlp)\n' +
-    '✅ Works with all YouTube videos\n\n' +
+    '✅ Fast and reliable API\n' +
+    '✅ No bot detection issues\n\n' +
     'Just send me a YouTube URL to get started!',
     { parse_mode: 'Markdown' }
   );
@@ -180,8 +173,7 @@ bot.help((ctx) => {
     '• youtube.com/watch?v=...\n' +
     '• youtu.be/...\n' +
     '• youtube.com/shorts/...\n\n' +
-    '⚠️ *Note:* Files larger than 50MB may fail due to Telegram limits.\n' +
-    'Use lower quality or audio-only for large videos.',
+    '⚠️ *Note:* Files larger than 50MB may fail due to Telegram limits.',
     { parse_mode: 'Markdown' }
   );
 });
@@ -213,10 +205,9 @@ async function handleYouTubeUrl(ctx, url) {
   const processingMsg = await ctx.reply('⏳ Fetching video information...');
   
   try {
-    const info = await getVideoInfo(url);
-    const qualities = getQualityOptions(info);
+    const data = await getVideoInfo(url);
     
-    if (qualities.length === 0) {
+    if (!data.result || !data.result.formats) {
       await ctx.telegram.editMessageText(
         ctx.chat.id,
         processingMsg.message_id,
@@ -225,21 +216,27 @@ async function handleYouTubeUrl(ctx, url) {
       );
       return;
     }
+
+    const result = data.result;
+    const videoId = extractVideoId(url);
     
     // Create buttons for quality options
     const buttons = [];
     
-    // Video quality buttons
-    qualities.forEach(quality => {
-      buttons.push([Markup.button.callback(`📹 ${quality}`, `video_${quality}_${info.id}`)]);
+    // Video quality buttons (get unique qualities)
+    const videoFormats = result.formats.filter(f => f.quality && f.hasVideo && f.hasAudio);
+    const uniqueQualities = [...new Set(videoFormats.map(f => f.quality))];
+    
+    uniqueQualities.slice(0, 5).forEach(quality => {
+      buttons.push([Markup.button.callback(`📹 ${quality}`, `video_${quality}_${videoId}`)]);
     });
     
     // Audio only button
-    buttons.push([Markup.button.callback('🎵 Audio Only (MP3)', `audio_${info.id}`)]);
+    buttons.push([Markup.button.callback('🎵 Audio Only (MP3)', `audio_${videoId}`)]);
     
-    const title = info.title || 'Unknown Title';
-    const duration = formatDuration(info.duration);
-    const views = info.view_count ? parseInt(info.view_count).toLocaleString() : 'Unknown';
+    const title = result.title || 'Unknown Title';
+    const duration = formatDuration(result.duration);
+    const views = result.viewCount ? parseInt(result.viewCount).toLocaleString() : 'Unknown';
     
     await ctx.telegram.editMessageText(
       ctx.chat.id,
@@ -247,7 +244,8 @@ async function handleYouTubeUrl(ctx, url) {
       null,
       `*${title}*\n\n` +
       `⏱ Duration: ${duration}\n` +
-      `👁 Views: ${views}\n\n` +
+      `👁 Views: ${views}\n` +
+      `📺 Channel: ${result.channel || 'Unknown'}\n\n` +
       `Select quality:`,
       {
         parse_mode: 'Markdown',
@@ -269,7 +267,10 @@ async function handleYouTubeUrl(ctx, url) {
 // Handle callback queries (button clicks)
 bot.on('callback_query', async (ctx) => {
   const data = ctx.callbackQuery.data;
-  const [type, quality, videoId] = data.split('_');
+  const parts = data.split('_');
+  const type = parts[0];
+  const quality = parts[1];
+  const videoId = parts[2];
   
   await ctx.answerCbQuery();
   await ctx.editMessageText('⏳ Preparing download... Please wait...');
@@ -301,32 +302,29 @@ async function downloadVideo(ctx, url, quality, videoId) {
   const outputPath = path.join(TEMP_DIR, `${sanitizedId}_${quality}.mp4`);
   
   try {
-    await ctx.editMessageText('⬇️ Downloading video...');
+    await ctx.editMessageText('⏳ Fetching download link...');
     
-    const height = quality.replace('p', '');
+    const data = await getVideoInfo(url);
     
-    // Download with yt-dlp with anti-bot measures
-    await ytDlp.execPromise([
-      url,
-      '-f', `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`,
-      '--merge-output-format', 'mp4',
-      '-o', outputPath,
-      '--no-playlist',
-      '--no-warnings',
-      '--extractor-args', 'youtube:player_client=android_creator',
-      '--user-agent', 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; en_US)',
-      '--no-check-certificates',
-      '--concurrent-fragments', '5',
-      '--retries', '10',
-      '--fragment-retries', '10',
-      '--newline'
-    ]);
-    
-    // Check if file exists and size
-    if (!fs.existsSync(outputPath)) {
-      throw new Error('Download failed - file not created');
+    if (!data.result || !data.result.formats) {
+      throw new Error('No formats available');
     }
     
+    // Find the format with requested quality
+    const format = data.result.formats.find(f => 
+      f.quality === quality && f.hasVideo && f.hasAudio
+    );
+    
+    if (!format || !format.url) {
+      throw new Error('Selected quality not available');
+    }
+    
+    await ctx.editMessageText('⬇️ Downloading video...');
+    
+    // Download the file
+    await downloadFile(format.url, outputPath);
+    
+    // Check file size
     const stats = fs.statSync(outputPath);
     const fileSizeMB = stats.size / (1024 * 1024);
     
@@ -338,12 +336,10 @@ async function downloadVideo(ctx, url, quality, videoId) {
     
     await ctx.editMessageText(`⬆️ Uploading to Telegram (${fileSizeMB.toFixed(2)}MB)...`);
     
-    const info = await getVideoInfo(url);
-    
     await ctx.replyWithVideo(
       { source: outputPath },
       { 
-        caption: `${info.title || 'Video'}\n\n📹 Quality: ${quality}`,
+        caption: `${data.result.title || 'Video'}\n\n📹 Quality: ${quality}`,
         supports_streaming: true
       }
     );
@@ -365,30 +361,29 @@ async function downloadAudio(ctx, url, videoId) {
   const outputPath = path.join(TEMP_DIR, `${sanitizedId}.mp3`);
   
   try {
-    await ctx.editMessageText('⬇️ Downloading audio...');
+    await ctx.editMessageText('⏳ Fetching download link...');
     
-    // Download and convert to MP3 with yt-dlp with anti-bot measures
-    await ytDlp.execPromise([
-      url,
-      '-f', 'bestaudio/best',
-      '-x',
-      '--audio-format', 'mp3',
-      '--audio-quality', '192K',
-      '-o', outputPath,
-      '--no-playlist',
-      '--no-warnings',
-      '--extractor-args', 'youtube:player_client=android_creator',
-      '--user-agent', 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; en_US)',
-      '--no-check-certificates',
-      '--concurrent-fragments', '5',
-      '--retries', '10',
-      '--newline'
-    ]);
+    const data = await getVideoInfo(url);
     
-    if (!fs.existsSync(outputPath)) {
-      throw new Error('Download failed - file not created');
+    if (!data.result || !data.result.formats) {
+      throw new Error('No formats available');
     }
     
+    // Find audio format
+    const audioFormat = data.result.formats.find(f => 
+      f.hasAudio && !f.hasVideo
+    ) || data.result.formats.find(f => f.hasAudio);
+    
+    if (!audioFormat || !audioFormat.url) {
+      throw new Error('Audio format not available');
+    }
+    
+    await ctx.editMessageText('⬇️ Downloading audio...');
+    
+    // Download the file
+    await downloadFile(audioFormat.url, outputPath);
+    
+    // Check file size
     const stats = fs.statSync(outputPath);
     const fileSizeMB = stats.size / (1024 * 1024);
     
@@ -400,14 +395,12 @@ async function downloadAudio(ctx, url, videoId) {
     
     await ctx.editMessageText(`⬆️ Uploading to Telegram (${fileSizeMB.toFixed(2)}MB)...`);
     
-    const info = await getVideoInfo(url);
-    
     await ctx.replyWithAudio(
       { source: outputPath },
       {
-        caption: `🎵 ${info.title || 'Audio'}`,
-        title: info.title || 'Audio',
-        performer: info.uploader || 'Unknown'
+        caption: `🎵 ${data.result.title || 'Audio'}`,
+        title: data.result.title || 'Audio',
+        performer: data.result.channel || 'Unknown'
       }
     );
     
@@ -433,26 +426,14 @@ bot.catch((err, ctx) => {
 });
 
 // Start bot
-async function startBot() {
-  try {
-    console.log('🤖 Starting bot...');
-    
-    // Setup yt-dlp first
-    await setupYtDlp();
-    
-    // Then launch bot
-    await bot.launch();
-    console.log('✅ Bot started successfully!');
-    
-    // Enable graceful stop
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
-    
-  } catch (error) {
-    console.error('❌ Failed to start bot:', error);
+console.log('🤖 Bot starting...');
+bot.launch()
+  .then(() => console.log('✅ Bot started successfully!'))
+  .catch(err => {
+    console.error('❌ Failed to start bot:', err);
     process.exit(1);
-  }
-}
+  });
 
-// Start everything
-startBot();
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
