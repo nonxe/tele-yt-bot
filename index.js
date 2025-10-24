@@ -75,13 +75,13 @@ function extractVideoId(url) {
 // Get video info from API
 async function getVideoInfo(url) {
   try {
-    const response = await fetch(API_BASE_URL, {
-      method: 'POST',
+    const apiUrl = `${API_BASE_URL}?url=${encodeURIComponent(url)}&apikey=${API_KEY}`;
+    
+    const response = await fetch(apiUrl, {
+      method: 'GET',
       headers: {
-        'Content-Type': 'application/json',
-        'apikey': API_KEY
-      },
-      body: JSON.stringify({ url: url })
+        'Content-Type': 'application/json'
+      }
     });
 
     if (!response.ok) {
