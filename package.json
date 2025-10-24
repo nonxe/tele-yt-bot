@@ -1,7 +1,7 @@
 {
   "name": "tele-yt-bot",
-  "version": "2.0.0",
-  "description": "Telegram YouTube downloader bot with yt-dlp",
+  "version": "3.0.0",
+  "description": "Telegram YouTube downloader bot with API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -17,7 +17,6 @@
   "license": "MIT",
   "dependencies": {
     "telegraf": "^4.16.3",
-    "yt-dlp-wrap": "^2.3.12",
     "node-fetch": "^2.7.0"
   },
   "devDependencies": {
