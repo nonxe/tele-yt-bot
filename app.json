@@ -13,12 +13,6 @@
   ],
   "buildpacks": [
     {
-      "url": "heroku/python"
-    },
-    {
-      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
-    },
-    {
       "url": "heroku/nodejs"
     }
   ],
@@ -31,6 +25,11 @@
     "BOT_TOKEN": {
       "description": "Your Telegram Bot Token from @BotFather",
       "required": true
+    },
+    "API_KEY": {
+      "description": "YouTube Downloader API Key",
+      "value": ".r-e406e8b5fc4e447112d95703",
+      "required": false
     }
   },
   "stack": "heroku-24"
